@@ -29,7 +29,7 @@ Retrieving all objects
 .. _retrieving-objects-with-filters:
 
 Retrieving objects with filters
-----------------------------------------
+-------------------------------
     Typically, you'll want to query only a subset of the records in your database.
 
     That can be accomplished with the QuerySet's ``.filter(\*\*)`` method.
@@ -156,7 +156,7 @@ Filtering Operators
 
             # or the nicer syntax
 
-            Automobile.objects.filter(Automobile.manufacturer == 'Tesla')
+            q.filter(Automobile.year >= 2010)
 
     :attr:`< (__lt) <query.QueryOperator.LessThanOperator>`
 
@@ -270,9 +270,12 @@ Values Lists
 
 
 Batch Queries
-===============
+=============
 
     cqlengine now supports batch queries using the BatchQuery class. Batch queries can be started and stopped manually, or within a context manager. To add queries to the batch object, you just need to precede the create/save/delete call with a call to batch, and pass in the batch object.
+
+Batch Query General Use Pattern
+-------------------------------
 
     You can only create, update, and delete rows with a batch query, attempting to read rows out of the database with a batch query will fail.
 
@@ -312,6 +315,57 @@ Batch Queries
         ExampleModel.objects(id=some_id2).batch(b).delete()
         b.execute()
 
+
+    Typically you will not want the block to execute if an exception occurs inside the `with` block.  However, in the case that this is desirable, it's achievable by using the following syntax:
+
+    .. code-block:: python
+
+        with BatchQuery(execute_on_exception=True) as b:
+            LogEntry.batch(b).create(k=1, v=1)
+            mystery_function() # exception thrown in here
+            LogEntry.batch(b).create(k=1, v=2) # this code is never reached due to the exception, but anything leading up to here will execute in the batch.
+
+    If an exception is thrown somewhere in the block, any statements that have been added to the batch will still be executed.  This is useful for some logging situations.
+
+Batch Query Execution Callbacks
+-------------------------------
+
+    In order to allow secondary tasks to be chained to the end of batch, BatchQuery instances allow callbacks to be
+    registered with the batch, to be executed immediately after the batch executes.
+
+    Multiple callbacks can be attached to same BatchQuery instance, they are executed in the same order that they
+    are added to the batch.
+
+    The callbacks attached to a given batch instance are executed only if the batch executes. If the batch is used as a
+    context manager and an exception is raised, the queued up callbacks will not be run.
+
+    .. code-block:: python
+
+        def my_callback(*args, **kwargs):
+            pass
+
+        batch = BatchQuery()
+
+        batch.add_callback(my_callback)
+        batch.add_callback(my_callback, 'positional arg', named_arg='named arg value')
+
+        # if you need reference to the batch within the callback,
+        # just trap it in the arguments to be passed to the callback:
+        batch.add_callback(my_callback, cqlengine_batch=batch)
+
+        # once the batch executes...
+        batch.execute()
+
+        # the effect of the above scheduled callbacks will be similar to
+        my_callback()
+        my_callback('positional arg', named_arg='named arg value')
+        my_callback(cqlengine_batch=batch)
+
+    Failure in any of the callbacks does not affect the batch's execution, as the callbacks are started after the execution
+    of the batch is complete.
+
+
+
 QuerySet method reference
 =========================
 
@@ -320,6 +374,15 @@ QuerySet method reference
     .. method:: all()
 
         Returns a queryset matching all rows
+
+    .. method:: batch(batch_object)
+
+        Sets the batch object to run the query on. Note that running a select query with a batch object will raise an exception
+
+    .. method:: consistency(consistency_setting)
+
+        Sets the consistency level for the operation.  Options may be imported from the top level :attr:`cqlengine` package.
+
 
     .. method:: count()
 
@@ -353,3 +416,81 @@ QuerySet method reference
     .. method:: allow_filtering()
 
         Enables the (usually) unwise practive of querying on a clustering key without also defining a partition key
+
+    .. method:: timestamp(timestamp_or_long_or_datetime)
+
+        Allows for custom timestamps to be saved with the record.
+
+    .. method:: ttl(ttl_in_seconds)
+
+        :param ttl_in_seconds: time in seconds in which the saved values should expire
+        :type ttl_in_seconds: int
+
+        Sets the ttl to run the query query with. Note that running a select query with a ttl value will raise an exception
+
+    .. method:: update(**values)
+
+        Performs an update on the row selected by the queryset. Include values to update in the
+        update like so:
+
+        .. code-block:: python
+            Model.objects(key=n).update(value='x')
+
+        Passing in updates for columns which are not part of the model will raise a ValidationError.
+        Per column validation will be performed, but instance level validation will not
+        (`Model.validate` is not called).
+
+        The queryset update method also supports blindly adding and removing elements from container columns, without
+        loading a model instance from Cassandra.
+
+        Using the syntax `.update(column_name={x, y, z})` will overwrite the contents of the container, like updating a
+        non container column. However, adding `__<operation>` to the end of the keyword arg, makes the update call add
+        or remove items from the collection, without overwriting then entire column.
+
+
+        Given the model below, here are the operations that can be performed on the different container columns:
+
+        .. code-block:: python
+
+            class Row(Model):
+                row_id      = columns.Integer(primary_key=True)
+                set_column  = columns.Set(Integer)
+                list_column = columns.Set(Integer)
+                map_column  = columns.Set(Integer, Integer)
+
+        :class:`~cqlengine.columns.Set`
+
+        - `add`: adds the elements of the given set to the column
+        - `remove`: removes the elements of the given set to the column
+
+
+        .. code-block:: python
+
+            # add elements to a set
+            Row.objects(row_id=5).update(set_column__add={6})
+
+            # remove elements to a set
+            Row.objects(row_id=5).update(set_column__remove={4})
+
+        :class:`~cqlengine.columns.List`
+
+        - `append`: appends the elements of the given list to the end of the column
+        - `prepend`: prepends the elements of the given list to the beginning of the column
+
+        .. code-block:: python
+
+            # append items to a list
+            Row.objects(row_id=5).update(list_column__append=[6, 7])
+
+            # prepend items to a list
+            Row.objects(row_id=5).update(list_column__prepend=[1, 2])
+
+
+        :class:`~cqlengine.columns.Map`
+
+        - `update`: adds the given keys/values to the columns, creating new entries if they didn't exist, and overwriting old ones if they did
+
+        .. code-block:: python
+
+            # add items to a map
+            Row.objects(row_id=5).update(map_column__update={1: 2, 3: 4})

@@ -1,7 +1,9 @@
 import uuid
+import mock
 
 from cqlengine import columns
 from cqlengine import models
+from cqlengine.connection import ConnectionPool
 from cqlengine.tests.base import BaseCassEngTestCase
 from cqlengine import management
 
@@ -45,8 +47,8 @@ class TestPolymorphicClassConstruction(BaseCassEngTestCase):
         assert Base._is_polymorphic_base
         assert not M1._is_polymorphic_base
 
-        assert Base._polymorphic_column == Base.type1
-        assert M1._polymorphic_column == M1.type1
+        assert Base._polymorphic_column is Base._columns['type1']
+        assert M1._polymorphic_column is M1._columns['type1']
 
         assert Base._polymorphic_column_name == 'type1'
         assert M1._polymorphic_column_name == 'type1'
@@ -117,6 +119,21 @@ class TestPolymorphicModel(BaseCassEngTestCase):
 
         assert isinstance(p1r, Poly1)
         assert isinstance(p2r, Poly2)
+
+    def test_delete_on_polymorphic_subclass_does_not_include_polymorphic_key(self):
+        p1 = Poly1.create()
+
+        with mock.patch.object(ConnectionPool, 'execute') as m:
+            Poly1.objects(partition=p1.partition).delete()
+
+        # make sure our polymorphic key isn't in the CQL
+        # not sure how we would even get here if it was in there
+        # since the CQL would fail.
+
+        self.assertNotIn("row_type", m.call_args[0][0])
+
+
+
 
 
 class UnindexedPolyBase(models.Model):

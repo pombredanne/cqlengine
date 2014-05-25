@@ -1,12 +1,10 @@
 from collections import OrderedDict
 import re
-
 from cqlengine import columns
 from cqlengine.exceptions import ModelException, CQLEngineException, ValidationError
 from cqlengine.query import ModelQuerySet, DMLQuery, AbstractQueryableColumn
 from cqlengine.query import DoesNotExist as _DoesNotExist
 from cqlengine.query import MultipleObjectsReturned as _MultipleObjectsReturned
-
 
 class ModelDefinitionException(ModelException): pass
 
@@ -71,6 +69,72 @@ class QuerySetDescriptor(object):
         raise NotImplementedError
 
 
+class TTLDescriptor(object):
+    """
+    returns a query set descriptor
+    """
+    def __get__(self, instance, model):
+        if instance:
+            #instance = copy.deepcopy(instance)
+            # instance method
+            def ttl_setter(ts):
+                instance._ttl = ts
+                return instance
+            return ttl_setter
+
+        qs = model.__queryset__(model)
+
+        def ttl_setter(ts):
+            qs._ttl = ts
+            return qs
+
+        return ttl_setter
+
+    def __call__(self, *args, **kwargs):
+        raise NotImplementedError
+
+class TimestampDescriptor(object):
+    """
+    returns a query set descriptor with a timestamp specified
+    """
+    def __get__(self, instance, model):
+        if instance:
+            # instance method
+            def timestamp_setter(ts):
+                instance._timestamp = ts
+                return instance
+            return timestamp_setter
+
+        return model.objects.timestamp
+
+
+    def __call__(self, *args, **kwargs):
+        raise NotImplementedError
+
+class ConsistencyDescriptor(object):
+    """
+    returns a query set descriptor if called on Class, instance if it was an instance call
+    """
+    def __get__(self, instance, model):
+        if instance:
+            #instance = copy.deepcopy(instance)
+            def consistency_setter(consistency):
+                instance.__consistency__ = consistency
+                return instance
+            return consistency_setter
+
+        qs = model.__queryset__(model)
+
+        def consistency_setter(consistency):
+            qs._consistency = consistency
+            return qs
+
+        return consistency_setter
+
+    def __call__(self, *args, **kwargs):
+        raise NotImplementedError
+
+
 class ColumnQueryEvaluator(AbstractQueryableColumn):
     """
     Wraps a column and allows it to be used in comparator
@@ -83,7 +147,11 @@ class ColumnQueryEvaluator(AbstractQueryableColumn):
     def __init__(self, column):
         self.column = column
 
+    def __unicode__(self):
+        return self.column.db_field_name
+
     def _get_column(self):
+        """ :rtype: ColumnQueryEvaluator """
         return self.column
 
 
@@ -111,10 +179,9 @@ class ColumnDescriptor(object):
         :param instance: the model instance
         :type instance: Model
         """
-
-        if instance:
+        try:
             return instance._values[self.column.column_name].getval()
-        else:
+        except AttributeError as e:
             return self.query_evaluator
 
     def __set__(self, instance, value):
@@ -148,21 +215,28 @@ class BaseModel(object):
     class MultipleObjectsReturned(_MultipleObjectsReturned): pass
 
     objects = QuerySetDescriptor()
+    ttl = TTLDescriptor()
+    consistency = ConsistencyDescriptor()
 
-    #table names will be generated automatically from it's model and package name
-    #however, you can also define them manually here
+    # custom timestamps, see USING TIMESTAMP X
+    timestamp = TimestampDescriptor()
+
+    # _len is lazily created by __len__
+
+    # table names will be generated automatically from it's model
+    # however, you can also define them manually here
     __table_name__ = None
 
-    #the keyspace for this model
+    # the keyspace for this model
     __keyspace__ = None
 
-    #polymorphism options
+    # polymorphism options
     __polymorphic_key__ = None
 
     # compaction options
     __compaction__ = None
     __compaction_tombstone_compaction_interval__ = None
-    __compaction_tombstone_threshold = None
+    __compaction_tombstone_threshold__ = None
 
     # compaction - size tiered options
     __compaction_bucket_high__ = None
@@ -179,10 +253,18 @@ class BaseModel(object):
     __queryset__ = ModelQuerySet
     __dmlquery__ = DMLQuery
 
+    #__ttl__ = None # this doesn't seem to be used
+    __consistency__ = None # can be set per query
+
     __read_repair_chance__ = 0.1
+
+
+    _timestamp = None # optional timestamp to include with the operation (USING TIMESTAMP)
 
     def __init__(self, **values):
         self._values = {}
+        self._ttl = None
+        self._timestamp = None
 
         for name, column in self._columns.items():
             value =  values.get(name, None)
@@ -195,6 +277,17 @@ class BaseModel(object):
         # that update should be used when persisting changes
         self._is_persisted = False
         self._batch = None
+
+
+    def __repr__(self):
+        """
+        Pretty printing of models by their primary key
+        """
+        return '{} <{}>'.format(self.__class__.__name__,
+                                ', '.join(('{}={}'.format(k, getattr(self, k)) for k,v in self._primary_keys.iteritems()))
+                                )
+
+
 
     @classmethod
     def _discover_polymorphic_submodels(cls):
@@ -284,7 +377,7 @@ class BaseModel(object):
 
         # check attribute keys
         keys = set(self._columns.keys())
-        other_keys = set(self._columns.keys())
+        other_keys = set(other._columns.keys())
         if keys != other_keys:
             return False
 
@@ -329,6 +422,49 @@ class BaseModel(object):
             val = col.validate(getattr(self, name))
             setattr(self, name, val)
 
+    ### Let an instance be used like a dict of its columns keys/values
+
+    def __iter__(self):
+        """ Iterate over column ids. """
+        for column_id in self._columns.keys():
+            yield column_id
+
+    def __getitem__(self, key):
+        """ Returns column's value. """
+        if not isinstance(key, basestring):
+            raise TypeError
+        if key not in self._columns.keys():
+            raise KeyError
+        return getattr(self, key)
+
+    def __setitem__(self, key, val):
+        """ Sets a column's value. """
+        if not isinstance(key, basestring):
+            raise TypeError
+        if key not in self._columns.keys():
+            raise KeyError
+        return setattr(self, key, val)
+
+    def __len__(self):
+        """ Returns the number of columns defined on that model. """
+        try:
+            return self._len
+        except:
+            self._len = len(self._columns.keys())
+            return self._len
+
+    def keys(self):
+        """ Returns list of column's IDs. """
+        return [k for k in self]
+
+    def values(self):
+        """ Returns list of column's values. """
+        return [self[k] for k in self]
+
+    def items(self):
+        """ Returns a list of columns's IDs/values. """
+        return [(k, self[k]) for k in self]
+
     def _as_dict(self):
         """ Returns a map of column names to cleaned values """
         values = self._dynamic_columns or {}
@@ -356,7 +492,6 @@ class BaseModel(object):
         return cls.objects.get(*args, **kwargs)
 
     def save(self):
-
         # handle polymorphic models
         if self._is_polymorphic:
             if self._is_polymorphic_base:
@@ -366,18 +501,67 @@ class BaseModel(object):
 
         is_new = self.pk is None
         self.validate()
-        self.__dmlquery__(self.__class__, self, batch=self._batch).save()
+        self.__dmlquery__(self.__class__, self,
+                          batch=self._batch,
+                          ttl=self._ttl,
+                          timestamp=self._timestamp,
+                          consistency=self.__consistency__).save()
 
         #reset the value managers
         for v in self._values.values():
             v.reset_previous_value()
         self._is_persisted = True
 
+        self._ttl = None
+        self._timestamp = None
+
+        return self
+
+    def update(self, **values):
+        for k, v in values.items():
+            col = self._columns.get(k)
+
+            # check for nonexistant columns
+            if col is None:
+                raise ValidationError("{}.{} has no column named: {}".format(self.__module__, self.__class__.__name__, k))
+
+            # check for primary key update attempts
+            if col.is_primary_key:
+                raise ValidationError("Cannot apply update to primary key '{}' for {}.{}".format(k, self.__module__, self.__class__.__name__))
+
+            setattr(self, k, v)
+
+        # handle polymorphic models
+        if self._is_polymorphic:
+            if self._is_polymorphic_base:
+                raise PolyMorphicModelException('cannot update polymorphic base model')
+            else:
+                setattr(self, self._polymorphic_column_name, self.__polymorphic_key__)
+
+        self.validate()
+        self.__dmlquery__(self.__class__, self,
+                          batch=self._batch,
+                          ttl=self._ttl,
+                          timestamp=self._timestamp,
+                          consistency=self.__consistency__).update()
+
+        #reset the value managers
+        for v in self._values.values():
+            v.reset_previous_value()
+        self._is_persisted = True
+
+        self._ttl = None
+        self._timestamp = None
+
         return self
 
     def delete(self):
         """ Deletes this instance """
-        self.__dmlquery__(self.__class__, self, batch=self._batch).delete()
+        self.__dmlquery__(self.__class__, self, batch=self._batch, timestamp=self._timestamp, consistency=self.__consistency__).delete()
+
+    def get_changed_columns(self):
+        """ returns a list of the columns that have been updated since instantiation or save """
+        return [k for k,v in self._values.items() if v.changed]
 
     @classmethod
     def _class_batch(cls, batch):
@@ -387,7 +571,9 @@ class BaseModel(object):
         self._batch = batch
         return self
 
+
     batch = hybrid_classmethod(_class_batch, _inst_batch)
+
 
 
 class ModelMetaClass(type):

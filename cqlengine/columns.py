@@ -1,10 +1,11 @@
 #column field types
-from copy import deepcopy
+from copy import deepcopy, copy
 from datetime import datetime
 from datetime import date
 import re
 from uuid import uuid1, uuid4
 from cql.query import cql_quote
+from cql.cqltypes import DateType
 
 from cqlengine.exceptions import ValidationError
 
@@ -32,7 +33,7 @@ class BaseValueManager(object):
         return self.value != self.previous_value
 
     def reset_previous_value(self):
-        self.previous_value = deepcopy(self.value)
+        self.previous_value = copy(self.value)
 
     def getval(self):
         return self.value
@@ -198,14 +199,27 @@ class Column(object):
     def get_cql(self):
         return '"{}"'.format(self.db_field_name)
 
+    def _val_is_null(self, val):
+        """ determines if the given value equates to a null value for the given column type """
+        return val is None
+
 
 class Bytes(Column):
     db_type = 'blob'
 
+    class Quoter(ValueQuoter):
+        def __str__(self):
+            return '0x' + self.value.encode('hex')
+
     def to_database(self, value):
         val = super(Bytes, self).to_database(value)
         if val is None: return
-        return val.encode('hex')
+
+        return self.Quoter(val)
+
+    def to_python(self, value):
+        #return value[2:].decode('hex')
+        return value
 
 
 class Ascii(Column):
@@ -317,11 +331,15 @@ class DateTime(Column):
     db_type = 'timestamp'
 
     def to_python(self, value):
+        if value is None: return
         if isinstance(value, datetime):
             return value
         elif isinstance(value, date):
             return datetime(*(value.timetuple()[:6]))
-        return datetime.utcfromtimestamp(value)
+        try:
+            return datetime.utcfromtimestamp(value)
+        except TypeError:
+            return datetime.utcfromtimestamp(DateType.deserialize(value))
 
     def to_database(self, value):
         value = super(DateTime, self).to_database(value)
@@ -340,17 +358,20 @@ class DateTime(Column):
 class Date(Column):
     db_type = 'timestamp'
 
-
     def to_python(self, value):
+        if value is None: return
         if isinstance(value, datetime):
             return value.date()
         elif isinstance(value, date):
             return value
-
-        return datetime.utcfromtimestamp(value).date()
+        try:
+            return datetime.utcfromtimestamp(value).date()
+        except TypeError:
+            return datetime.utcfromtimestamp(DateType.deserialize(value)).date()
 
     def to_database(self, value):
         value = super(Date, self).to_database(value)
+        if value is None: return
         if isinstance(value, datetime):
             value = value.date()
         if not isinstance(value, date):
@@ -365,7 +386,7 @@ class UUID(Column):
     """
     db_type = 'uuid'
 
-    re_uuid = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    re_uuid = re.compile(r'[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}')
 
     def validate(self, value):
         val = super(UUID, self).validate(value)
@@ -373,7 +394,7 @@ class UUID(Column):
         from uuid import UUID as _UUID
         if isinstance(val, _UUID): return val
         if isinstance(val, basestring) and self.re_uuid.match(val):
-                return _UUID(val)
+            return _UUID(val)
         raise ValidationError("{} is not a valid uuid".format(value))
 
     def to_python(self, value):
@@ -435,11 +456,17 @@ class Boolean(Column):
         def __str__(self):
             return 'true' if self.value else 'false'
 
-    def to_python(self, value):
+    def validate(self, value):
+        """ Always returns a Python boolean. """
+        if isinstance(value, self.Quoter):
+            value = value.value
         return bool(value)
 
+    def to_python(self, value):
+        return self.validate(value)
+
     def to_database(self, value):
-        return self.Quoter(bool(value))
+        return self.Quoter(self.validate(value))
 
 
 class Float(Column):
@@ -486,7 +513,9 @@ class Decimal(Column):
 
 class BaseContainerColumn(Column):
     """
-    Base Container type
+    Base Container type for collection-like columns.
+
+    https://cassandra.apache.org/doc/cql3/CQL.html#collections
     """
 
     def __init__(self, value_type, **kwargs):
@@ -510,18 +539,35 @@ class BaseContainerColumn(Column):
 
         super(BaseContainerColumn, self).__init__(**kwargs)
 
+    def validate(self, value):
+        value = super(BaseContainerColumn, self).validate(value)
+        # It is dangerous to let collections have more than 65535.
+        # See: https://issues.apache.org/jira/browse/CASSANDRA-5428
+        if value is not None and len(value) > 65535:
+            raise ValidationError("Collection can't have more than 65535 elements.")
+        return value
+
     def get_column_def(self):
         """
         Returns a column definition for CQL table definition
         """
         db_type = self.db_type.format(self.value_type.db_type)
-        return '{} {}'.format(self.db_field_name, db_type)
+        return '{} {}'.format(self.cql, db_type)
 
     def get_update_statement(self, val, prev, ctx):
         """
         Used to add partial update statements
         """
         raise NotImplementedError
+
+    def _val_is_null(self, val):
+        return not val
+
+
+class BaseContainerQuoter(ValueQuoter):
+
+    def __nonzero__(self):
+        return bool(self.value)
 
 
 class Set(BaseContainerColumn):
@@ -532,7 +578,7 @@ class Set(BaseContainerColumn):
     """
     db_type = 'set<{}>'
 
-    class Quoter(ValueQuoter):
+    class Quoter(BaseContainerQuoter):
 
         def __str__(self):
             cq = cql_quote
@@ -557,6 +603,9 @@ class Set(BaseContainerColumn):
                 raise ValidationError('{} is not a set object'.format(val))
             else:
                 raise ValidationError('{} cannot be coerced to a set object'.format(val))
+
+        if None in val:
+            raise ValidationError("None not allowed in a set")
 
         return {self.value_col.validate(v) for v in val}
 
@@ -622,13 +671,16 @@ class List(BaseContainerColumn):
     """
     db_type = 'list<{}>'
 
-    class Quoter(ValueQuoter):
+    class Quoter(BaseContainerQuoter):
 
         def __str__(self):
             cq = cql_quote
             return '[' + ', '.join([cq(v) for v in self.value]) + ']'
 
-    def __init__(self, value_type, default=set, **kwargs):
+        def __nonzero__(self):
+            return bool(self.value)
+
+    def __init__(self, value_type, default=list, **kwargs):
         return super(List, self).__init__(value_type=value_type, default=default, **kwargs)
 
     def validate(self, value):
@@ -636,6 +688,8 @@ class List(BaseContainerColumn):
         if val is None: return
         if not isinstance(val, (set, list, tuple)):
             raise ValidationError('{} is not a list object'.format(val))
+        if None in val:
+            raise ValidationError("None is not allowed in a list")
         return [self.value_col.validate(v) for v in val]
 
     def to_python(self, value):
@@ -733,11 +787,17 @@ class Map(BaseContainerColumn):
 
     db_type = 'map<{}, {}>'
 
-    class Quoter(ValueQuoter):
+    class Quoter(BaseContainerQuoter):
 
         def __str__(self):
             cq = cql_quote
             return '{' + ', '.join([cq(k) + ':' + cq(v) for k,v in self.value.items()]) + '}'
+
+        def get(self, key):
+            return self.value.get(key)
+
+        def keys(self):
+            return self.value.keys()
 
     def __init__(self, key_type, value_type, default=dict, **kwargs):
         """
@@ -768,7 +828,7 @@ class Map(BaseContainerColumn):
             self.key_type.db_type,
             self.value_type.db_type
         )
-        return '{} {}'.format(self.db_field_name, db_type)
+        return '{} {}'.format(self.cql, db_type)
 
     def validate(self, value):
         val = super(Map, self).validate(value)
@@ -849,8 +909,15 @@ class _PartitionKeysToken(Column):
         self.partition_columns = model._partition_keys.values()
         super(_PartitionKeysToken, self).__init__(partition_key=True)
 
+    @property
+    def db_field_name(self):
+        return 'token({})'.format(', '.join(['"{}"'.format(c.db_field_name) for c in self.partition_columns]))
+
     def to_database(self, value):
-        raise NotImplementedError
+        from cqlengine.functions import Token
+        assert isinstance(value, Token)
+        value.set_columns(self.partition_columns)
+        return value
 
     def get_cql(self):
         return "token({})".format(", ".join(c.cql for c in self.partition_columns))

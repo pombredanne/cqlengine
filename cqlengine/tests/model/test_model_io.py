@@ -1,5 +1,7 @@
 from uuid import uuid4
 import random
+from datetime import date
+from operator import itemgetter
 from cqlengine.tests.base import BaseCassEngTestCase
 
 from cqlengine.management import create_table
@@ -42,7 +44,28 @@ class TestModelIO(BaseCassEngTestCase):
         for cname in tm._columns.keys():
             self.assertEquals(getattr(tm, cname), getattr(tm2, cname))
 
+    def test_model_read_as_dict(self):
+        """
+        Tests that columns of an instance can be read as a dict.
+        """
+        tm = TestModel.create(count=8, text='123456789', a_bool=True)
+        column_dict = {
+            'id': tm.id,
+            'count': tm.count,
+            'text': tm.text,
+            'a_bool': tm.a_bool,
+        }
+        self.assertEquals(sorted(tm.keys()), sorted(column_dict.keys()))
+        self.assertEquals(sorted(tm.values()), sorted(column_dict.values()))
+        self.assertEquals(
+            sorted(tm.items(), key=itemgetter(0)),
+            sorted(column_dict.items(), key=itemgetter(0)))
+        self.assertEquals(len(tm), len(column_dict))
+        for column_id in column_dict.keys():
+            self.assertEqual(tm[column_id], column_dict[column_id])
 
+        tm['count'] = 6
+        self.assertEqual(tm.count, 6)
 
     def test_model_updating_works_properly(self):
         """
@@ -78,7 +101,6 @@ class TestModelIO(BaseCassEngTestCase):
         assert tm2.text is None
         assert tm2._values['text'].previous_value is None
 
-
     def test_a_sensical_error_is_raised_if_you_try_to_create_a_table_twice(self):
         """
         """
@@ -91,6 +113,7 @@ class TestMultiKeyModel(Model):
     cluster     = columns.Integer(primary_key=True)
     count       = columns.Integer(required=False)
     text        = columns.Text(required=False)
+
 
 class TestDeleting(BaseCassEngTestCase):
 
@@ -158,6 +181,14 @@ class TestUpdating(BaseCassEngTestCase):
         assert check.count is None
         assert check.text is None
 
+    def test_get_changed_columns(self):
+        assert self.instance.get_changed_columns() == []
+        self.instance.count = 1
+        changes = self.instance.get_changed_columns()
+        assert len(changes) == 1
+        assert changes == ['count']
+        self.instance.save()
+        assert self.instance.get_changed_columns() == []
 
 
 class TestCanUpdate(BaseCassEngTestCase):
@@ -232,3 +263,33 @@ class TestQueryQuoting(BaseCassEngTestCase):
         assert model1.insert == model2[0].insert
 
 
+class TestQueryModel(Model):
+    test_id = columns.UUID(primary_key=True, default=uuid4)
+    date = columns.Date(primary_key=True)
+    description = columns.Text()
+
+
+class TestQuerying(BaseCassEngTestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        super(TestQuerying, cls).setUpClass()
+        delete_table(TestQueryModel)
+        create_table(TestQueryModel)
+
+    @classmethod
+    def tearDownClass(cls):
+        super(TestQuerying, cls).tearDownClass()
+        delete_table(TestQueryModel)
+
+    def test_query_with_date(self):
+        uid = uuid4()
+        day = date(2013, 11, 26)
+        TestQueryModel.create(test_id=uid, date=day, description=u'foo')
+
+        inst = TestQueryModel.filter(
+            TestQueryModel.test_id == uid,
+            TestQueryModel.date == day).limit(1).first()
+
+        assert inst.test_id == uid
+        assert inst.date == day

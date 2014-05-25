@@ -1,14 +1,14 @@
 from mock import MagicMock, patch
 
+from cqlengine import ONE
 from cqlengine.exceptions import CQLEngineException
-from cqlengine.management import create_table, delete_table, get_fields
+from cqlengine.management import create_table, delete_table, get_fields, sync_table
 from cqlengine.tests.base import BaseCassEngTestCase
 from cqlengine.connection import ConnectionPool, Host
 from cqlengine import management
 from cqlengine.tests.query.test_queryset import TestModel
 from cqlengine.models import Model
-from cqlengine import columns
-
+from cqlengine import columns, SizeTieredCompactionStrategy, LeveledCompactionStrategy
 
 class ConnectionPoolFailoverTestCase(BaseCassEngTestCase):
     """Test cassandra connection pooling."""
@@ -22,7 +22,7 @@ class ConnectionPoolFailoverTestCase(BaseCassEngTestCase):
         with patch('cqlengine.connection.cql.connect') as mock:
             mock.side_effect=CQLEngineException
             with self.assertRaises(CQLEngineException):
-                self.pool.execute("select * from system.peers", {})
+                self.pool.execute("select * from system.peers", {}, ONE)
 
     def test_dead_node(self):
         """
@@ -75,6 +75,13 @@ class CapitalizedKeyModel(Model):
     firstKey = columns.Integer(primary_key=True)
     secondKey = columns.Integer(primary_key=True)
     someData = columns.Text()
+
+class PrimaryKeysOnlyModel(Model):
+    __compaction__ = LeveledCompactionStrategy
+
+    first_ey = columns.Integer(primary_key=True)
+    second_key = columns.Integer(primary_key=True)
+
 
 class CapitalizedKeyTest(BaseCassEngTestCase):
 
@@ -141,3 +148,37 @@ class AddColumnTest(BaseCassEngTestCase):
         self.assertEqual(len(fields), 4)
 
 
+class SyncTableTests(BaseCassEngTestCase):
+
+    def setUp(self):
+        delete_table(PrimaryKeysOnlyModel)
+
+    def test_sync_table_works_with_primary_keys_only_tables(self):
+
+        # This is "create table":
+
+        sync_table(PrimaryKeysOnlyModel)
+
+        # let's make sure settings persisted correctly:
+
+        assert PrimaryKeysOnlyModel.__compaction__ == LeveledCompactionStrategy
+        # blows up with DoesNotExist if table does not exist
+        table_settings = management.get_table_settings(PrimaryKeysOnlyModel)
+        # let make sure the flag we care about
+        assert LeveledCompactionStrategy in table_settings['compaction_strategy_class']
+
+
+        # Now we are "updating" the table:
+
+        # setting up something to change
+        PrimaryKeysOnlyModel.__compaction__ = SizeTieredCompactionStrategy
+
+        # primary-keys-only tables do not create entries in system.schema_columns
+        # table. Only non-primary keys are added to that table.
+        # Our code must deal with that eventuality properly (not crash)
+        # on subsequent runs of sync_table (which runs get_fields internally)
+        get_fields(PrimaryKeysOnlyModel)
+        sync_table(PrimaryKeysOnlyModel)
+
+        table_settings = management.get_table_settings(PrimaryKeysOnlyModel)
+        assert SizeTieredCompactionStrategy in table_settings['compaction_strategy_class']

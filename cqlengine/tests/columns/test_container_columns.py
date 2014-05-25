@@ -4,17 +4,19 @@ from uuid import uuid4
 
 from cqlengine import Model, ValidationError
 from cqlengine import columns
-from cqlengine.management import create_table, delete_table
+from cqlengine.management import sync_table, drop_table
 from cqlengine.tests.base import BaseCassEngTestCase
 
 
 class TestSetModel(Model):
+
     partition = columns.UUID(primary_key=True, default=uuid4)
     int_set = columns.Set(columns.Integer, required=False)
     text_set = columns.Set(columns.Text, required=False)
 
 
 class JsonTestColumn(columns.Column):
+
     db_type = 'text'
 
     def to_python(self, value):
@@ -34,13 +36,17 @@ class TestSetColumn(BaseCassEngTestCase):
     @classmethod
     def setUpClass(cls):
         super(TestSetColumn, cls).setUpClass()
-        delete_table(TestSetModel)
-        create_table(TestSetModel)
+        drop_table(TestSetModel)
+        sync_table(TestSetModel)
 
     @classmethod
     def tearDownClass(cls):
         super(TestSetColumn, cls).tearDownClass()
-        delete_table(TestSetModel)
+        drop_table(TestSetModel)
+
+    def test_add_none_fails(self):
+        with self.assertRaises(ValidationError):
+            m = TestSetModel.create(int_set=set([None]))
 
     def test_empty_set_initial(self):
         """
@@ -50,6 +56,16 @@ class TestSetColumn(BaseCassEngTestCase):
         m = TestSetModel.create()
         m.int_set.add(5)
         m.save()
+
+    def test_deleting_last_item_should_succeed(self):
+        m = TestSetModel.create()
+        m.int_set.add(5)
+        m.save()
+        m.int_set.remove(5)
+        m.save()
+
+        m = TestSetModel.get(partition=m.partition)
+        self.assertNotIn(5, m.int_set)
 
     def test_empty_set_retrieval(self):
         m = TestSetModel.create()
@@ -76,6 +92,14 @@ class TestSetColumn(BaseCassEngTestCase):
         """
         with self.assertRaises(ValidationError):
             TestSetModel.create(int_set={'string', True}, text_set={1, 3.0})
+
+    def test_element_count_validation(self):
+        """
+        Tests that big collections are detected and raise an exception.
+        """
+        TestSetModel.create(text_set={str(uuid4()) for i in range(65535)})
+        with self.assertRaises(ValidationError):
+            TestSetModel.create(text_set={str(uuid4()) for i in range(65536)})
 
     def test_partial_updates(self):
         """ Tests that partial udpates work as expected """
@@ -105,7 +129,7 @@ class TestSetColumn(BaseCassEngTestCase):
         assert len([s for s in statements if '"TEST" = "TEST" +' in s]) == 1
 
     def test_update_from_none(self):
-        """ Tests that updating an 'None' list creates a straight insert statement """
+        """ Tests that updating a 'None' list creates a straight insert statement """
         ctx = {}
         col = columns.Set(columns.Integer, db_field="TEST")
         statements = col.get_update_statement({1, 2, 3, 4}, None, ctx)
@@ -154,24 +178,37 @@ class TestSetColumn(BaseCassEngTestCase):
         py_val = column.to_python(db_val.value)
         assert py_val == val
 
+    def test_default_empty_container_saving(self):
+        """ tests that the default empty container is not saved if it hasn't been updated """
+        pkey = uuid4()
+        # create a row with set data
+        TestSetModel.create(partition=pkey, int_set={3, 4})
+        # create another with no set data
+        TestSetModel.create(partition=pkey)
+
+        m = TestSetModel.get(partition=pkey)
+        self.assertEqual(m.int_set, {3, 4})
+
 
 class TestListModel(Model):
+
     partition = columns.UUID(primary_key=True, default=uuid4)
     int_list = columns.List(columns.Integer, required=False)
     text_list = columns.List(columns.Text, required=False)
 
 
 class TestListColumn(BaseCassEngTestCase):
+
     @classmethod
     def setUpClass(cls):
         super(TestListColumn, cls).setUpClass()
-        delete_table(TestListModel)
-        create_table(TestListModel)
+        drop_table(TestListModel)
+        sync_table(TestListModel)
 
     @classmethod
     def tearDownClass(cls):
         super(TestListColumn, cls).tearDownClass()
-        delete_table(TestListModel)
+        drop_table(TestListModel)
 
     def test_initial(self):
         tmp = TestListModel.create()
@@ -205,6 +242,14 @@ class TestListColumn(BaseCassEngTestCase):
         """
         with self.assertRaises(ValidationError):
             TestListModel.create(int_list=['string', True], text_list=[1, 3.0])
+
+    def test_element_count_validation(self):
+        """
+        Tests that big collections are detected and raise an exception.
+        """
+        TestListModel.create(text_list=[str(uuid4()) for i in range(65535)])
+        with self.assertRaises(ValidationError):
+            TestListModel.create(text_list=[str(uuid4()) for i in range(65536)])
 
     def test_partial_updates(self):
         """ Tests that partial udpates work as expected """
@@ -282,34 +327,86 @@ class TestListColumn(BaseCassEngTestCase):
         py_val = column.to_python(db_val.value)
         assert py_val == val
 
+    def test_default_empty_container_saving(self):
+        """ tests that the default empty container is not saved if it hasn't been updated """
+        pkey = uuid4()
+        # create a row with list data
+        TestListModel.create(partition=pkey, int_list=[1,2,3,4])
+        # create another with no list data
+        TestListModel.create(partition=pkey)
+
+        m = TestListModel.get(partition=pkey)
+        self.assertEqual(m.int_list, [1,2,3,4])
+
+    def test_remove_entry_works(self):
+        pkey = uuid4()
+        tmp = TestListModel.create(partition=pkey, int_list=[1,2])
+        tmp.int_list.pop()
+        tmp.update()
+        tmp = TestListModel.get(partition=pkey)
+        self.assertEqual(tmp.int_list, [1])
+
+    def test_update_from_non_empty_to_empty(self):
+        pkey = uuid4()
+        tmp = TestListModel.create(partition=pkey, int_list=[1,2])
+        tmp.int_list = []
+        tmp.update()
+
+        tmp = TestListModel.get(partition=pkey)
+        self.assertEqual(tmp.int_list, [])
+
+    def test_insert_none(self):
+        pkey = uuid4()
+        with self.assertRaises(ValidationError):
+            TestListModel.create(partition=pkey, int_list=[None])
+
+
 class TestMapModel(Model):
+
     partition = columns.UUID(primary_key=True, default=uuid4)
     int_map = columns.Map(columns.Integer, columns.UUID, required=False)
     text_map = columns.Map(columns.Text, columns.DateTime, required=False)
 
 
 class TestMapColumn(BaseCassEngTestCase):
+
     @classmethod
     def setUpClass(cls):
         super(TestMapColumn, cls).setUpClass()
-        delete_table(TestMapModel)
-        create_table(TestMapModel)
+        drop_table(TestMapModel)
+        sync_table(TestMapModel)
 
     @classmethod
     def tearDownClass(cls):
         super(TestMapColumn, cls).tearDownClass()
-        delete_table(TestMapModel)
+        drop_table(TestMapModel)
 
     def test_empty_default(self):
         tmp = TestMapModel.create()
         tmp.int_map['blah'] = 1
+
+    def test_add_none_as_map_key(self):
+        with self.assertRaises(ValidationError):
+            TestMapModel.create(int_map={None:1})
+
+    def test_add_none_as_map_value(self):
+        with self.assertRaises(ValidationError):
+            TestMapModel.create(int_map={None:1})
 
     def test_empty_retrieve(self):
         tmp = TestMapModel.create()
         tmp2 = TestMapModel.get(partition=tmp.partition)
         tmp2.int_map['blah'] = 1
 
+    def test_remove_last_entry_works(self):
+        tmp = TestMapModel.create()
+        tmp.text_map["blah"] = datetime.now()
+        tmp.save()
+        del tmp.text_map["blah"]
+        tmp.save()
 
+        tmp = TestMapModel.get(partition=tmp.partition)
+        self.assertNotIn("blah", tmp.int_map)
 
     def test_io_success(self):
         """ Tests that a basic usage works as expected """
@@ -339,6 +436,14 @@ class TestMapColumn(BaseCassEngTestCase):
         """
         with self.assertRaises(ValidationError):
             TestMapModel.create(int_map={'key': 2, uuid4(): 'val'}, text_map={2: 5})
+
+    def test_element_count_validation(self):
+        """
+        Tests that big collections are detected and raise an exception.
+        """
+        TestMapModel.create(text_map={str(uuid4()): i for i in range(65535)})
+        with self.assertRaises(ValidationError):
+            TestMapModel.create(text_map={str(uuid4()): i for i in range(65536)})
 
     def test_partial_updates(self):
         """ Tests that partial udpates work as expected """
@@ -370,6 +475,10 @@ class TestMapColumn(BaseCassEngTestCase):
         m2 = TestMapModel.get(partition=m.partition)
         assert m2.int_map == expected
 
+        m2.int_map = None
+        m2.save()
+        m3 = TestMapModel.get(partition=m.partition)
+        assert m3.int_map != expected
 
     def test_updates_to_none(self):
         """ Tests that setting the field to None works as expected """
@@ -406,6 +515,18 @@ class TestMapColumn(BaseCassEngTestCase):
         py_val = column.to_python(db_val.value)
         assert py_val == val
 
+    def test_default_empty_container_saving(self):
+        """ tests that the default empty container is not saved if it hasn't been updated """
+        pkey = uuid4()
+        tmap = {1: uuid4(), 2: uuid4()}
+        # create a row with set data
+        TestMapModel.create(partition=pkey, int_map=tmap)
+        # create another with no set data
+        TestMapModel.create(partition=pkey)
+
+        m = TestMapModel.get(partition=pkey)
+        self.assertEqual(m.int_map, tmap)
+
 #    def test_partial_update_creation(self):
 #        """
 #        Tests that proper update statements are created for a partial list update
@@ -422,3 +543,26 @@ class TestMapColumn(BaseCassEngTestCase):
 #        assert len([v for v in ctx.values() if [7,8,9] == v.value]) == 1
 #        assert len([s for s in statements if '"TEST" = "TEST" +' in s]) == 1
 #        assert len([s for s in statements if '+ "TEST"' in s]) == 1
+
+
+class TestCamelMapModel(Model):
+
+    partition = columns.UUID(primary_key=True, default=uuid4)
+    camelMap = columns.Map(columns.Text, columns.Integer, required=False)
+
+
+class TestCamelMapColumn(BaseCassEngTestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        super(TestCamelMapColumn, cls).setUpClass()
+        drop_table(TestCamelMapModel)
+        sync_table(TestCamelMapModel)
+
+    @classmethod
+    def tearDownClass(cls):
+        super(TestCamelMapColumn, cls).tearDownClass()
+        drop_table(TestCamelMapModel)
+
+    def test_camelcase_column(self):
+        TestCamelMapModel.create(partition=None, camelMap={'blah': 1})

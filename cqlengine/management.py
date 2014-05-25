@@ -1,6 +1,7 @@
 import json
 import warnings
 from cqlengine import SizeTieredCompactionStrategy, LeveledCompactionStrategy
+from cqlengine import ONE
 from cqlengine.named import NamedTable
 
 from cqlengine.connection import connection_manager, execute
@@ -28,7 +29,7 @@ def create_keyspace(name, strategy_class='SimpleStrategy', replication_factor=3,
     :param **replication_values: 1.2 only, additional values to ad to the replication data map
     """
     with connection_manager() as con:
-        _, keyspaces = con.execute("""SELECT keyspace_name FROM system.schema_keyspaces""", {})
+        _, keyspaces = con.execute("""SELECT keyspace_name FROM system.schema_keyspaces""", {}, ONE)
         if name not in [r[0] for r in keyspaces]:
             #try the 1.2 method
             replication_map = {
@@ -36,6 +37,11 @@ def create_keyspace(name, strategy_class='SimpleStrategy', replication_factor=3,
                 'replication_factor':replication_factor
             }
             replication_map.update(replication_values)
+            if strategy_class.lower() != 'simplestrategy':
+                # Although the Cassandra documentation states for `replication_factor`
+                # that it is "Required if class is SimpleStrategy; otherwise,
+                # not used." we get an error if it is present.
+                replication_map.pop('replication_factor', None)
 
             query = """
             CREATE KEYSPACE {}
@@ -50,7 +56,7 @@ def create_keyspace(name, strategy_class='SimpleStrategy', replication_factor=3,
 
 def delete_keyspace(name):
     with connection_manager() as con:
-        _, keyspaces = con.execute("""SELECT keyspace_name FROM system.schema_keyspaces""", {})
+        _, keyspaces = con.execute("""SELECT keyspace_name FROM system.schema_keyspaces""", {}, ONE)
         if name in [r[0] for r in keyspaces]:
             execute("DROP KEYSPACE {}".format(name))
 
@@ -59,6 +65,16 @@ def create_table(model, create_missing_keyspace=True):
     sync_table(model, create_missing_keyspace)
 
 def sync_table(model, create_missing_keyspace=True):
+    """
+    Inspects the model and creates / updates the corresponding table and columns.
+
+    Note that the attributes removed from the model are not deleted on the database.
+    They become effectively ignored by (will not show up on) the model.
+
+    :param create_missing_keyspace: (Defaults to True) Flags to us that we need to create missing keyspace
+        mentioned in the model automatically.
+    :type create_missing_keyspace: bool
+    """
 
     if model.__abstract__:
         raise CQLEngineException("cannot create table from abstract model")
@@ -75,7 +91,8 @@ def sync_table(model, create_missing_keyspace=True):
     with connection_manager() as con:
         tables = con.execute(
             "SELECT columnfamily_name from system.schema_columnfamilies WHERE keyspace_name = :ks_name",
-            {'ks_name': ks_name}
+            {'ks_name': ks_name},
+            ONE
         )
     tables = [x[0] for x in tables.results]
 
@@ -110,7 +127,8 @@ def sync_table(model, create_missing_keyspace=True):
     with connection_manager() as con:
         _, idx_names = con.execute(
             "SELECT index_name from system.\"IndexInfo\" WHERE table_name=:table_name",
-            {'table_name': raw_cf_name}
+            {'table_name': raw_cf_name},
+            ONE
         )
 
     idx_names = [i[0] for i in idx_names]
@@ -199,9 +217,12 @@ def get_compaction_options(model):
             raise CQLEngineException("{} is limited to {}".format(key, limited_to_strategy))
 
         if tmp:
-            result[key] = tmp
+            # Explicitly cast the values to strings to be able to compare the
+            # values against introspected values from Cassandra.
+            result[key] = str(tmp)
 
     setter('tombstone_compaction_interval')
+    setter('tombstone_threshold')
 
     setter('bucket_high', SizeTieredCompactionStrategy)
     setter('bucket_low', SizeTieredCompactionStrategy)
@@ -209,7 +230,7 @@ def get_compaction_options(model):
     setter('min_threshold', SizeTieredCompactionStrategy)
     setter('min_sstable_size', SizeTieredCompactionStrategy)
 
-    setter("sstable_size_in_mb", LeveledCompactionStrategy)
+    setter('sstable_size_in_mb', LeveledCompactionStrategy)
 
     return result
 
@@ -220,22 +241,44 @@ def get_fields(model):
     col_family = model.column_family_name(include_keyspace=False)
 
     with connection_manager() as con:
-        query = "SELECT column_name, validator FROM system.schema_columns \
+        query = "SELECT * FROM system.schema_columns \
                  WHERE keyspace_name = :ks_name AND columnfamily_name = :col_family"
 
         logger.debug("get_fields %s %s", ks_name, col_family)
 
-        tmp = con.execute(query, {'ks_name':ks_name, 'col_family':col_family})
-    return [Field(x[0], x[1]) for x in tmp.results]
+        tmp = con.execute(query, {'ks_name': ks_name, 'col_family': col_family}, ONE)
+
+    # Tables containing only primary keys do not appear to create
+    # any entries in system.schema_columns, as only non-primary-key attributes
+    # appear to be inserted into the schema_columns table
+    if not tmp.results:
+        return []
+
+    column_name_positon = tmp.columns.index('column_name')
+    validator_positon = tmp.columns.index('validator')
+    try:
+        type_position = tmp.columns.index('type')
+        return [Field(x[column_name_positon], x[validator_positon]) for x in tmp.results if x[type_position] == 'regular']
+    except ValueError:
+        return [Field(x[column_name_positon], x[validator_positon]) for x in tmp.results]
     # convert to Field named tuples
 
 
 def get_table_settings(model):
-    return schema_columnfamilies.get(keyspace_name=model._get_keyspace(),
-                                     columnfamily_name=model.column_family_name(include_keyspace=False))
+    return schema_columnfamilies.objects.consistency(ONE).get(
+        keyspace_name=model._get_keyspace(),
+        columnfamily_name=model.column_family_name(include_keyspace=False))
 
 
 def update_compaction(model):
+    """Updates the compaction options for the given model if necessary.
+
+    :param model: The model to update.
+
+    :return: `True`, if the compaction options were modified in Cassandra,
+        `False` otherwise.
+    :rtype: bool
+    """
     logger.debug("Checking %s for compaction differences", model)
     row = get_table_settings(model)
     # check compaction_strategy_class
@@ -244,13 +287,17 @@ def update_compaction(model):
 
     do_update = not row['compaction_strategy_class'].endswith(model.__compaction__)
 
-    existing_options = row['compaction_strategy_options']
-    existing_options = json.loads(existing_options)
+    existing_options = json.loads(row['compaction_strategy_options'])
+    # The min/max thresholds are stored differently in the system data dictionary
+    existing_options.update({
+        'min_threshold': str(row['min_compaction_threshold']),
+        'max_threshold': str(row['max_compaction_threshold']),
+        })
 
     desired_options = get_compaction_options(model)
     desired_options.pop('class', None)
 
-    for k,v in desired_options.items():
+    for k, v in desired_options.items():
         val = existing_options.pop(k, None)
         if val != v:
             do_update = True
@@ -264,11 +311,15 @@ def update_compaction(model):
         query = "ALTER TABLE {} with compaction = {}".format(cf_name, options)
         logger.debug(query)
         execute(query)
+        return True
+
+    return False
 
 
 def delete_table(model):
     warnings.warn("delete_table has been deprecated in favor of drop_table()", DeprecationWarning)
     return drop_table(model)
+
 
 def drop_table(model):
 
@@ -277,7 +328,8 @@ def drop_table(model):
     with connection_manager() as con:
         _, tables = con.execute(
             "SELECT columnfamily_name from system.schema_columnfamilies WHERE keyspace_name = :ks_name",
-            {'ks_name': ks_name}
+            {'ks_name': ks_name},
+            ONE
         )
     raw_cf_name = model.column_family_name(include_keyspace=False)
     if raw_cf_name not in [t[0] for t in tables]:

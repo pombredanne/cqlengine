@@ -69,6 +69,14 @@ class TestDatetime(BaseCassEngTestCase):
         dt2 = self.DatetimeTest.objects(test_id=0).first()
         assert dt2.created_at.isoformat() == datetime(today.year, today.month, today.day).isoformat()
 
+    def test_datetime_none(self):
+        dt = self.DatetimeTest.objects.create(test_id=1, created_at=None)
+        dt2 = self.DatetimeTest.objects(test_id=1).first()
+        assert dt2.created_at is None
+
+        dts = self.DatetimeTest.objects.filter(test_id=1).values_list('created_at')
+        assert dts[0][0] is None
+
 
 class TestVarInt(BaseCassEngTestCase):
     class VarIntTest(Model):
@@ -121,6 +129,14 @@ class TestDate(BaseCassEngTestCase):
         assert isinstance(dt2.created_at, date)
         assert dt2.created_at.isoformat() == now.date().isoformat()
 
+    def test_date_none(self):
+        self.DateTest.objects.create(test_id=1, created_at=None)
+        dt2 = self.DateTest.objects(test_id=1).first()
+        assert dt2.created_at is None
+
+        dts = self.DateTest.objects(test_id=1).values_list('created_at')
+        assert dts[0][0] is None
+
 
 class TestDecimal(BaseCassEngTestCase):
     class DecimalTest(Model):
@@ -145,6 +161,33 @@ class TestDecimal(BaseCassEngTestCase):
         dt = self.DecimalTest.objects.create(test_id=0, dec_val=5)
         dt2 = self.DecimalTest.objects(test_id=0).first()
         assert dt2.dec_val == D('5')
+
+class TestUUID(BaseCassEngTestCase):
+    class UUIDTest(Model):
+        test_id = Integer(primary_key=True)
+        a_uuid = UUID(default=uuid4())
+
+    @classmethod
+    def setUpClass(cls):
+        super(TestUUID, cls).setUpClass()
+        create_table(cls.UUIDTest)
+
+    @classmethod
+    def tearDownClass(cls):
+        super(TestUUID, cls).tearDownClass()
+        delete_table(cls.UUIDTest)  
+
+    def test_uuid_str_with_dashes(self):
+        a_uuid = uuid4()
+        t0 = self.UUIDTest.create(test_id=0, a_uuid=str(a_uuid))
+        t1 = self.UUIDTest.get(test_id=0)
+        assert a_uuid == t1.a_uuid
+
+    def test_uuid_str_no_dashes(self):
+        a_uuid = uuid4()
+        t0 = self.UUIDTest.create(test_id=1, a_uuid=a_uuid.hex)
+        t1 = self.UUIDTest.get(test_id=1)
+        assert a_uuid == t1.a_uuid
 
 class TestTimeUUID(BaseCassEngTestCase):
     class TimeUUIDTest(Model):

@@ -84,8 +84,6 @@ Column Options
     :attr:`~cqlengine.columns.BaseColumn.index`
         If True, an index will be created for this column. Defaults to False.
 
-        *Note: Indexes can only be created on models with one primary key*
-
     :attr:`~cqlengine.columns.BaseColumn.db_field`
         Explicitly sets the name of the column in the database table. If this is left blank, the column name will be
         the same as the name of the column attribute. Defaults to None.
@@ -133,10 +131,32 @@ Model Methods
             #saves it to Cassandra
             person.save()
 
-
     .. method:: delete()
 
         Deletes the object from the database.
+
+    .. method:: batch(batch_object)
+
+        Sets the batch object to run instance updates and inserts queries with.
+
+    .. method:: timestamp(timedelta_or_datetime)
+
+        Sets the timestamp for the query
+
+    .. method:: ttl(ttl_in_sec)
+
+        Sets the ttl values to run instance updates and inserts queries with.
+
+    .. method:: update(**values)
+
+        Performs an update on the model instance. You can pass in values to set on the model
+        for updating, or you can call without values to execute an update against any modified
+        fields. If no fields on the model have been modified since loading, no query will be
+        performed. Model validation is performed normally.
+
+    .. method:: get_changed_columns()
+
+        Returns a list of column names that have changed since the model was instantiated or saved
 
 Model Attributes
 ================
@@ -241,7 +261,7 @@ Extending Model Validation
 
 
 Compaction Options
-====================
+==================
 
     As of cqlengine 0.7 we've added support for specifying compaction options.  cqlengine will only use your compaction options if you have a strategy set.  When a table is synced, it will be altered to match the compaction options set on your table.  This means that if you are changing settings manually they will be changed back on resync.  Do not use the compaction settings of cqlengine if you want to manage your compaction settings manually.
 
@@ -290,3 +310,24 @@ Compaction Options
             __compaction_tombstone_compaction_interval__ = 86400
 
     Tables may use `LeveledCompactionStrategy` or `SizeTieredCompactionStrategy`.  Both options are available in the top level cqlengine module.  To reiterate, you will need to set your `__compaction__` option explicitly in order for cqlengine to handle any of your settings.
+
+Manipulating model instances as dictionaries
+============================================
+
+    As of cqlengine 0.12, we've added support for treating model instances like dictionaries. See below for examples.
+
+    .. code-block:: python
+
+        class Person(Model):
+            first_name  = columns.Text()
+            last_name = columns.Text()
+
+        kevin = Person.create(first_name="Kevin", last_name="Deldycke")
+        dict(kevin)  # returns {'first_name': 'Kevin', 'last_name': 'Deldycke'}
+        kevin['first_name']  # returns 'Kevin'
+        kevin.keys()  # returns ['first_name', 'last_name']
+        kevin.values()  # returns ['Kevin', 'Deldycke']
+        kevin.items()  # returns [('first_name', 'Kevin'), ('last_name', 'Deldycke')]
+
+        kevin['first_name'] = 'KEVIN5000'  # changes the models first name
+

@@ -3,7 +3,11 @@
 #http://cassandra.apache.org/doc/cql/CQL.html
 
 from collections import namedtuple
-import Queue
+try:
+    import Queue as queue
+except ImportError:
+    # python 3
+    import queue
 import random
 
 import cql
@@ -17,6 +21,7 @@ from cql import OperationalError
 from contextlib import contextmanager
 
 from thrift.transport.TTransport import TTransportException
+from cqlengine.statements import BaseCQLStatement
 
 LOG = logging.getLogger('cqlengine.cql')
 
@@ -84,11 +89,16 @@ def setup(
         host = host.strip()
         host = host.split(':')
         if len(host) == 1:
-            _hosts.append(Host(host[0], 9160))
+            port = 9160
         elif len(host) == 2:
-            _hosts.append(Host(*host))
+            try:
+                port = int(host[1])
+            except ValueError:
+                raise CQLConnectionError("Can't parse port as int {}".format(':'.join(host)))
         else:
-            raise CQLConnectionError("Can't parse {}".format(''.join(host)))
+            raise CQLConnectionError("Can't parse host string {}".format(':'.join(host)))
+
+        _hosts.append(Host(host[0], port))
 
     if not _hosts:
         raise CQLConnectionError("At least one host required")
@@ -112,7 +122,7 @@ class ConnectionPool(object):
         self._consistency = consistency
         self._timeout = timeout
 
-        self._queue = Queue.Queue(maxsize=_max_connections)
+        self._queue = queue.Queue(maxsize=_max_connections)
 
     def clear(self):
         """
@@ -132,11 +142,11 @@ class ConnectionPool(object):
         a new one.
         """
         try:
-            if self._queue.empty():
-                return self._create_connection()
-            return self._queue.get()
-        except CQLConnectionError as cqle:
-            raise cqle
+            # get with block=False returns an item if one
+            # is immediately available, else raises the Empty exception
+            return self._queue.get(block=False)
+        except queue.Empty:
+            return self._create_connection()
 
     def put(self, conn):
         """
@@ -147,10 +157,10 @@ class ConnectionPool(object):
         :type conn: connection
         """
 
-        if self._queue.full():
+        try:
+            self._queue.put(conn, block=False)
+        except queue.Full:
             conn.close()
-        else:
-            self._queue.put(conn)
 
     def _create_transport(self, host):
         """
@@ -165,10 +175,10 @@ class ConnectionPool(object):
         from thrift.transport import TSocket, TTransport
 
         thrift_socket = TSocket.TSocket(host.name, host.port)
-        
+
         if self._timeout is not None:
             thrift_socket.setTimeout(self._timeout)
-            
+
         return TTransport.TFramedTransport(thrift_socket)
 
     def _create_connection(self):
@@ -196,23 +206,26 @@ class ConnectionPool(object):
                 )
                 new_conn.set_cql_version('3.0.0')
                 return new_conn
-            except Exception as e:
-                logging.debug("Could not establish connection to {}:{}".format(host.name, host.port))
-                pass
+            except Exception as exc:
+                logging.debug("Could not establish connection to"
+                              " {}:{} ({!r})".format(host.name, host.port, exc))
 
         raise CQLConnectionError("Could not connect to any server in cluster")
 
-    def execute(self, query, params):
+    def execute(self, query, params, consistency_level=None):
+        if not consistency_level:
+            consistency_level = self._consistency
+
         while True:
             try:
                 con = self.get()
                 if not con:
                     raise CQLEngineException("Error calling execute without calling setup.")
+                LOG.debug('{} {}'.format(query, repr(params)))
                 cur = con.cursor()
-                cur.execute(query, params)
+                cur.execute(query, params, consistency_level=consistency_level)
                 columns = [i[0] for i in cur.description or []]
                 results = [RowResult(r) for r in cur.fetchall()]
-                LOG.debug('{} {}'.format(query, repr(params)))
                 self.put(con)
                 return QueryResult(columns, results)
             except CQLConnectionError as ex:
@@ -226,9 +239,14 @@ class ConnectionPool(object):
                 raise ex
 
 
-def execute(query, params=None):
+def execute(query, params=None, consistency_level=None):
+    if isinstance(query, BaseCQLStatement):
+        params = query.get_context()
+        query = str(query)
     params = params or {}
-    return connection_pool.execute(query, params)
+    if consistency_level is None:
+        consistency_level = connection_pool._consistency
+    return connection_pool.execute(query, params, consistency_level)
 
 @contextmanager
 def connection_manager():
